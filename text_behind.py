@@ -94,15 +94,15 @@ def find_ffmpeg():
     except Exception:
         sys.exit('ffmpeg not found on PATH')
 
-def build_text_layer(W, H, main, sub, main_y, sub_y, main_size, sub_size,
+def build_text_layer(W, H, main, sub, main_x, main_y, sub_x, sub_y, main_size, sub_size,
                      fill, font_path, main_index=8, sub_index=4):
     A = Image.new('L', (W, H), 0)
     d = ImageDraw.Draw(A)
     f_main = ImageFont.truetype(font_path, main_size, index=main_index)
     f_sub  = ImageFont.truetype(font_path, sub_size,  index=sub_index)
-    d.text((W//2, main_y), main, font=f_main, fill=255, anchor='mm')
+    d.text((main_x, main_y), main, font=f_main, fill=255, anchor='mm')
     if sub:
-        d.text((W//2 + 2, sub_y), sub, font=f_sub, fill=255, anchor='mm')
+        d.text((sub_x + 2, sub_y), sub, font=f_sub, fill=255, anchor='mm')
     shadow = A.filter(ImageFilter.GaussianBlur(12))
     txt = Image.new('RGBA', (W, H), (0, 0, 0, 0))
     txt.paste(Image.new('RGBA', (W, H), fill + (255,)), mask=A)
@@ -123,6 +123,7 @@ def main():
     ap.add_argument('--auto-person', action='store_true', help='YOLO auto person detection instead of box prompts')
     ap.add_argument('--boxes', default='', help='SAM2 box prompts "x1,y1,x2,y2;x1,y1,x2,y2" in source pixels')
     ap.add_argument('--text-y', type=int, default=None, help='main text centre y (default: 50%% of height)')
+    ap.add_argument('--text-x', type=int, default=None, help='main text centre x (default: 50%% of width)')
     ap.add_argument('--sub-y', type=int, default=None, help='subline centre y (default: main + 130)')
     ap.add_argument('--main-size', type=int, default=130)
     ap.add_argument('--sub-size', type=int, default=44)
@@ -154,9 +155,11 @@ def main():
             boxes.append(tuple(float(v) for v in chunk.split(',')))
 
     fill = (245, 158, 11) if a.amber else (255, 255, 255)
+    main_x = a.text_x if a.text_x is not None else W // 2
     main_y = a.text_y if a.text_y is not None else H // 2
+    sub_x  = a.text_x if a.text_x is not None else W // 2
     sub_y  = a.sub_y  if a.sub_y  is not None else main_y + 130
-    sh, txt = build_text_layer(W, H, a.text, a.sub, main_y, sub_y,
+    sh, txt = build_text_layer(W, H, a.text, a.sub, main_x, main_y, sub_x, sub_y,
                                a.main_size, a.sub_size, fill, a.font)
 
     work = a.out + '_work'
