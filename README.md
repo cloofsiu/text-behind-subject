@@ -95,6 +95,11 @@ that's what sells the effect.
   fully hide it.
 - The mask edge is the only "cutout" quality cue — soft-depth shots
   (shallow DOF) may show a slightly crisp subject edge where the text crosses.
+- **Full-frame close-ups don't work**: the effect needs the subject's *edge*
+  to cross the text. If the subject fills the whole frame there is no edge to
+  straddle — shoot wider or crop so the subject has background around it.
+- Moving performers (dancing lion, walking actor) drift out of fixed box
+  prompts — use `--auto-person` for people, or re-prompt per refresh.
 
 ## Real-world result
 

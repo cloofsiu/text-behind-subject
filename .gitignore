@@ -2,3 +2,4 @@ __pycache__/
 *.pt
 *.mp4
 .tbs_probe/
+tests_local/
