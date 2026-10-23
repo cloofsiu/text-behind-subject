@@ -38,10 +38,17 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 import cv2  # opencv-python-headless: mask cleanup + feathering
 
-def refine_mask(mask_bool_small, W, H):
-    """upscale low-res mask -> close/open morphology -> drop specks -> feather."""
+def refine_mask(mask_bool_small, W, H, guide_gray=None):
+    """upscale low-res mask -> guided-filter edge snap -> cleanup -> tight feather.
+
+    guide_gray: float32 grayscale of the SAME frame (H,W), 0..1 — when given,
+    the mask boundary is snapped to the frame's real image edges (this is what
+    makes the cut edge hug the subject). Falls back to morphology-only when None.
+    """
     mfull = cv2.resize(mask_bool_small.astype(np.float32), (W, H),
                        interpolation=cv2.INTER_LINEAR)
+    if guide_gray is not None:
+        mfull = cv2.ximgproc.guidedFilter(guide_gray, mfull, radius=16, eps=1e-3)
     m8 = (mfull > 0.5).astype(np.uint8) * 255
     k = np.ones((5, 5), np.uint8)
     m8 = cv2.morphologyEx(m8, cv2.MORPH_CLOSE, k)
@@ -50,7 +57,7 @@ def refine_mask(mask_bool_small, W, H):
     for i in range(1, num):
         if stats[i, cv2.CC_STAT_AREA] < 3000:
             m8[lab == i] = 0
-    return Image.fromarray(cv2.GaussianBlur(m8, (0, 0), 1.8))
+    return Image.fromarray(cv2.GaussianBlur(m8, (0, 0), 1.0))
 
 def find_ffmpeg():
     try:
@@ -159,7 +166,8 @@ def main():
             elif prev is not None:
                 M = (0.6 * M + 0.4 * prev) > 0.4   # EMA vs flicker
             prev = m_small = M
-        mimg = refine_mask(m_small, W, H)
+        guide = cv2.cvtColor(np.asarray(frame), cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+        mimg = refine_mask(m_small, W, H, guide)
 
         comp = frame.convert('RGBA')
         comp.alpha_composite(sh, (6, 9))

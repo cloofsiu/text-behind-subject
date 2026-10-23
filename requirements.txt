@@ -1,4 +1,4 @@
 ultralytics>=8.4
 pillow>=10
 numpy
-opencv-python-headless
+opencv-contrib-python-headless
