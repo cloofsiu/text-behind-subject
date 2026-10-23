@@ -181,18 +181,18 @@ def main():
             if yolo is not None:
                 det = yolo.predict(arr, classes=[0], verbose=False, conf=0.4)[0]
                 if det.boxes is not None and len(det.boxes):
-                    for b in det.boxes.xyxy.cpu().numpy():
-                        sx, sy = W / (W // 2), H / (H // 2)
-                        r = sam.predict(arr, bboxes=[b.tolist()], verbose=False)[0]
-                        m = r.masks.data.cpu().numpy().max(axis=0) > 0.5
-                        M = m if M is None else (M | m)
+                    # batch ALL person boxes into ONE SAM2 call (encoder runs once)
+                    all_boxes = [b.tolist() for b in det.boxes.xyxy.cpu().numpy()]
+                    r = sam.predict(arr, bboxes=all_boxes, verbose=False)[0]
+                    if r.masks is not None and r.masks.data is not None and r.masks.data.numel() > 0:
+                        M = r.masks.data.cpu().numpy().max(axis=0) > 0.5
             else:
-                for b in boxes:
-                    r = sam.predict(arr, bboxes=[list(b)], verbose=False)[0]
-                    if r.masks is None or r.masks.data is None or r.masks.data.numel() == 0:
-                        continue
-                    m = r.masks.data.cpu().numpy().max(axis=0) > 0.5
-                    M = m if M is None else (M | m)
+                if boxes:
+                    sx = (W // 2) / W; sy = (H // 2) / H
+                    small_boxes = [[b[0]*sx, b[1]*sy, b[2]*sx, b[3]*sy] for b in boxes]
+                    r = sam.predict(arr, bboxes=small_boxes, verbose=False)[0]
+                    if r.masks is not None and r.masks.data is not None and r.masks.data.numel() > 0:
+                        M = r.masks.data.cpu().numpy().max(axis=0) > 0.5
             if M is None:
                 M = prev if prev is not None else np.zeros((H // 2, W // 2), bool)
             elif prev is not None:
