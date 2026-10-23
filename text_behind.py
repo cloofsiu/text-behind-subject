@@ -3,8 +3,9 @@
 text_behind.py — put BIG modern text BEHIND the subject in a video
 (text sandwiched between background and subject, the "text behind person" reel effect).
 
-Pipeline: YOLO/SAM2 subject mask (refreshed every N frames) -> PIL text layer
-(no border, soft blurred shadow) -> composite bg -> text -> subject.
+Pipeline: SAM2 subject mask (refreshed every N frames, morphologically cleaned
+and feathered) -> PIL text layer (no border, soft blurred shadow) ->
+composite bg -> text -> subject.
 
 KEY INSIGHT for static-camera shots: you do NOT need a mask every frame.
 Refresh the mask every N frames (0.25-0.5s) and reuse it in between — the
@@ -12,8 +13,13 @@ subject barely moves relative to the frame, so this is ~10x faster and
 visually identical. Handheld shots need a smaller --every and the built-in
 EMA smoothing handles residual sway.
 
+EDGE QUALITY: the (low-res) mask is upscaled, then morphologically cleaned
+(close pinholes / open specks / drop small islands) and feathered with a
+1.8px Gaussian — the soft alpha pastes the subject back over the text with
+a clean edge instead of an aliased staircase.
+
 Requirements:
-  pip install ultralytics pillow numpy
+  pip install ultralytics pillow numpy opencv-python-headless
   ffmpeg on PATH
 
 Usage (auto-detect people with YOLO):
@@ -30,6 +36,21 @@ Static camera? use --every 8 (mask every 1/3 s). Handheld? --every 4.
 import argparse, os, subprocess, sys
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
+import cv2  # opencv-python-headless: mask cleanup + feathering
+
+def refine_mask(mask_bool_small, W, H):
+    """upscale low-res mask -> close/open morphology -> drop specks -> feather."""
+    mfull = cv2.resize(mask_bool_small.astype(np.float32), (W, H),
+                       interpolation=cv2.INTER_LINEAR)
+    m8 = (mfull > 0.5).astype(np.uint8) * 255
+    k = np.ones((5, 5), np.uint8)
+    m8 = cv2.morphologyEx(m8, cv2.MORPH_CLOSE, k)
+    m8 = cv2.morphologyEx(m8, cv2.MORPH_OPEN, k)
+    num, lab, stats, _ = cv2.connectedComponentsWithStats(m8, 8)
+    for i in range(1, num):
+        if stats[i, cv2.CC_STAT_AREA] < 3000:
+            m8[lab == i] = 0
+    return Image.fromarray(cv2.GaussianBlur(m8, (0, 0), 1.8))
 
 def find_ffmpeg():
     try:
@@ -138,7 +159,7 @@ def main():
             elif prev is not None:
                 M = (0.6 * M + 0.4 * prev) > 0.4   # EMA vs flicker
             prev = m_small = M
-        mimg = Image.fromarray((m_small * 255).astype('uint8')).resize((W, H), Image.BILINEAR)
+        mimg = refine_mask(m_small, W, H)
 
         comp = frame.convert('RGBA')
         comp.alpha_composite(sh, (6, 9))
