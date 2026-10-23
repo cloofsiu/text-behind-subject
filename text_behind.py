@@ -39,12 +39,14 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 import cv2  # opencv-python-headless: mask cleanup + feathering
 
 def refine_mask(mask_bool_small, W, H, guide_gray=None):
-    """upscale low-res mask -> guided-filter edge snap -> cleanup -> tight feather.
+    """upscale -> guided-filter edge snap -> morphology -> per-column TOP-EDGE
+    SNAP -> 1D median boundary smoothing -> drop specks -> tight 1px feather.
 
-    guide_gray: float32 grayscale of the SAME frame (H,W), 0..1 — when given,
-    the mask boundary is snapped to the frame's real image edges (this is what
-    makes the cut edge hug the subject). Falls back to morphology-only when None.
-    """
+    guide_gray: float32 grayscale (H,W), 0..1 — snaps the mask boundary to the
+    frame's real image edges. The top-edge snap additionally pulls the mask's
+    top boundary down onto the strongest horizontal image edge within a small
+    band, which removes the systematic "fabric strip" bias that generous SAM2
+    box prompts leave above the true silhouette top."""
     mfull = cv2.resize(mask_bool_small.astype(np.float32), (W, H),
                        interpolation=cv2.INTER_LINEAR)
     if guide_gray is not None:
@@ -53,6 +55,33 @@ def refine_mask(mask_bool_small, W, H, guide_gray=None):
     k = np.ones((5, 5), np.uint8)
     m8 = cv2.morphologyEx(m8, cv2.MORPH_CLOSE, k)
     m8 = cv2.morphologyEx(m8, cv2.MORPH_OPEN, k)
+
+    Gb = None
+    if guide_gray is not None:
+        gray_u8 = (guide_gray * 255).astype(np.uint8)
+        Gb = np.abs(cv2.GaussianBlur(cv2.Sobel(gray_u8, cv2.CV_32F, 0, 1, ksize=3), (0, 0), 2))
+    if Gb is not None:
+        mb_ = m8 > 127
+        Hh, Ww = m8.shape
+        ys = np.zeros(Ww, int); has = mb_.any(axis=0)
+        ys[has] = np.argmax(mb_, axis=0)[has]
+        for x in np.where(has)[0]:
+            yb = ys[x]
+            lo, hi = max(0, yb-15), min(Hh, yb+36)
+            g = Gb[lo:hi, x]
+            ystar = lo + int(g.argmax())
+            if Gb[ystar, x] > 90 and ystar > yb + 1:
+                ys[x] = ystar
+        ysm = ys.copy()
+        for x in np.where(has)[0]:
+            lo2, hi2 = max(0, x-7), min(Ww, x+8)
+            seg = ys[lo2:hi2][has[lo2:hi2]]
+            if len(seg): ysm[x] = int(np.median(seg))
+        for x in np.where(has)[0]:
+            top = int(np.argmax(m8[:, x] > 127))
+            if ysm[x] > top:
+                m8[top:ysm[x], x] = 0
+
     num, lab, stats, _ = cv2.connectedComponentsWithStats(m8, 8)
     for i in range(1, num):
         if stats[i, cv2.CC_STAT_AREA] < 3000:

@@ -32,13 +32,15 @@ source frames ──► SAM2 subject mask (YOLO or box prompts)
 3. **Composite** — text (and its shadow) go over the background, then the
    original frame is re-painted through the subject mask, so the subject covers
    the text = the "behind" illusion. No green screen, no manual rotoscoping.
-4. **Edge refinement** — the low-res mask is upscaled, then refined in two
-   passes:
-   - **guided filter** (`cv2.ximgproc.guidedFilter`, radius 16) — snaps the
-     mask boundary to the *real image edges* of the frame (the physical
-     silhouette), which is what makes the cut edge "hug" the subject;
-   - morphology (close pinholes / open specks / drop small islands) and a
-     tight 1px feather for a clean soft cut instead of an aliased staircase.
+4. **Edge refinement** — the low-res mask is refined in passes:
+   - **guided filter** (`cv2.ximgproc.guidedFilter`, r=16) — snaps the mask
+     boundary to the *real image edges* of the frame;
+   - **per-column top-edge snap + 1D median smoothing** — pulls the mask's top
+     boundary onto the strongest horizontal image edge in a small band. This
+     removes the systematic "fabric strip" that generous SAM2 box prompts leave
+     above the true silhouette (the main cause of loose-looking edges);
+   - morphology (close/open, drop small islands) and a tight 1px feather for a
+     clean soft cut instead of an aliased staircase.
 
 ## The static-camera trick (why this is fast enough on a laptop)
 
