@@ -21,18 +21,25 @@ source frames ──► SAM2 subject mask (YOLO or box prompts)
 ```
 
 1. **Subject mask** — [SAM2](https://docs.ultralytics.com/models/sam-2/) via
-   `ultralytics`. Two prompting modes:
-   - `--auto-person`: YOLOv8-nano detects people each refresh, each person box
-     prompts SAM2, masks are unioned.
+   `ultralytics`. Prompting modes (combinable):
+   - `--auto-person`: YOLOv8-nano detects people each refresh, all person boxes
+     prompt SAM2 in one batched call, masks are unioned.
    - `--boxes`: you supply box prompts (source pixels) — the right choice for
      **objects/devices** that YOLO can't name.
+   - **Both together** = combined mode: persons AND objects occlude the text,
+     so the text sits in the depth gap between them (white robots no longer
+     wash the white text out — they hide it instead).
 2. **Text layer** — PIL. Big main line + small tracked subline, soft Gaussian
    shadow, no stroke, no box. Any TrueType/TTC font; default = macOS PingFang
    (Simplified/Traditional Chinese + Latin all fine).
-3. **Composite** — text (and its shadow) go over the background, then the
+3. **Optical-flow propagation** — between SAM2 refreshes the mask is warped
+   frame-to-frame with Farneback optical flow (`cv2.remap`), so the cut edge
+   *moves with the subject* instead of freezing until the next refresh.
+   Continuous edges without per-frame SAM2 cost.
+4. **Composite** — text (and its shadow) go over the background, then the
    original frame is re-painted through the subject mask, so the subject covers
    the text = the "behind" illusion. No green screen, no manual rotoscoping.
-4. **Edge refinement** — the low-res mask is refined in passes:
+5. **Edge refinement** — the low-res mask is refined in passes:
    - **guided filter** (`cv2.ximgproc.guidedFilter`, r=16) — snaps the mask
      boundary to the *real image edges* of the frame;
    - **per-column top-edge snap + 1D median smoothing** — pulls the mask's top

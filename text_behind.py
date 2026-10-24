@@ -153,7 +153,6 @@ def main():
         chunk = chunk.strip()
         if chunk:
             boxes.append(tuple(float(v) for v in chunk.split(',')))
-
     fill = (245, 158, 11) if a.amber else (255, 255, 255)
     main_x = a.text_x if a.text_x is not None else W // 2
     main_y = a.text_y if a.text_y is not None else H // 2
@@ -168,36 +167,54 @@ def main():
                     '-i',a.input,'-vf',f'fps={fps_n}','-pix_fmt','yuvj420p','-start_number','0','-q:v','2',
                     f'{work}/s%04d.jpg'], check=True)
 
-    prev = None
+    prev_gray = None
     m_small = None
+    sw, shh = W // 2, H // 2
     for i in range(n):
         fi = f'{work}/s{i:04d}.jpg'
         if not os.path.exists(fi): break
         frame = Image.open(fi).convert('RGB')
-        if i % a.every == 0 or prev is None:
-            small = frame.resize((W // 2, H // 2), Image.BILINEAR)
-            arr = np.asarray(small)
-            M = None
+        small = frame.resize((sw, shh), Image.BILINEAR)
+        arr = np.asarray(small)
+        cur_gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+
+        if i % a.every == 0 or m_small is None:
+            # --- refresh: SAM2 anchor (persons and/or boxes, UNIONED) ---
+            M_p = M_b = None
             if yolo is not None:
                 det = yolo.predict(arr, classes=[0], verbose=False, conf=0.4)[0]
                 if det.boxes is not None and len(det.boxes):
-                    # batch ALL person boxes into ONE SAM2 call (encoder runs once)
                     all_boxes = [b.tolist() for b in det.boxes.xyxy.cpu().numpy()]
                     r = sam.predict(arr, bboxes=all_boxes, verbose=False)[0]
                     if r.masks is not None and r.masks.data is not None and r.masks.data.numel() > 0:
-                        M = r.masks.data.cpu().numpy().max(axis=0) > 0.5
-            else:
-                if boxes:
-                    sx = (W // 2) / W; sy = (H // 2) / H
-                    small_boxes = [[b[0]*sx, b[1]*sy, b[2]*sx, b[3]*sy] for b in boxes]
-                    r = sam.predict(arr, bboxes=small_boxes, verbose=False)[0]
-                    if r.masks is not None and r.masks.data is not None and r.masks.data.numel() > 0:
-                        M = r.masks.data.cpu().numpy().max(axis=0) > 0.5
+                        M_p = r.masks.data.cpu().numpy().max(axis=0) > 0.5
+            if boxes:
+                sx = sw / W; sy = shh / H
+                small_boxes = [[b[0]*sx, b[1]*sy, b[2]*sx, b[3]*sy] for b in boxes]
+                r = sam.predict(arr, bboxes=small_boxes, verbose=False)[0]
+                if r.masks is not None and r.masks.data is not None and r.masks.data.numel() > 0:
+                    M_b = r.masks.data.cpu().numpy().max(axis=0) > 0.5
+            M = M_p if M_p is not None else M_b
+            if M_p is not None and M_b is not None:
+                M = M_p | M_b   # combined mode: person AND boxes occlude
             if M is None:
-                M = prev if prev is not None else np.zeros((H // 2, W // 2), bool)
-            elif prev is not None:
-                M = (0.6 * M + 0.4 * prev) > 0.4   # EMA vs flicker
-            prev = m_small = M
+                M = m_small if m_small is not None else np.zeros((shh, sw), bool)
+            elif m_small is not None:
+                M = (0.65 * M + 0.35 * m_small) > 0.4   # EMA vs flicker
+            m_small = M
+        else:
+            # --- propagate: optical flow moves the mask WITH the subject so
+            #     the cut edge stays continuous between SAM2 refreshes ---
+            flow = cv2.calcOpticalFlowFarneback(prev_gray, cur_gray, None,
+                                                0.5, 3, 15, 3, 5, 1.2, 0)
+            h_, w_ = m_small.shape
+            gx, gy = np.meshgrid(np.arange(w_, dtype=np.float32),
+                                 np.arange(h_, dtype=np.float32))
+            mx = gx + flow[..., 0]; my = gy + flow[..., 1]
+            m_small = cv2.remap(m_small.astype(np.float32), mx, my,
+                                cv2.INTER_LINEAR,
+                                borderMode=cv2.BORDER_REPLICATE) > 0.5
+        prev_gray = cur_gray
         guide = cv2.cvtColor(np.asarray(frame), cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
         mimg = refine_mask(m_small, W, H, guide)
 
