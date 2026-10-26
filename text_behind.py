@@ -154,6 +154,96 @@ def build_text_layer(W, H, main, sub, main_x, main_y, sub_x, sub_y, main_size, s
     sh.putalpha(shadow.point(lambda a: int(a * 0.55)))
     return sh, txt
 
+
+def run_video_engine(a, W, H, fps_n, n, sh, txt, work, out_path):
+    """Official SAM2 VIDEO predictor: prompt frame 0 once, the model's memory
+    module propagates the mask to EVERY frame with temporal consistency —
+    the fix for jumping text on moving subjects. MPS (Apple Metal) ≈ 0.9s/frame."""
+    import subprocess as sp, numpy as np, torch, os
+    from sam2.build_sam import build_sam2_video_predictor
+
+    dev = a.device
+    if dev == 'auto':
+        dev = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
+    ckpt = os.environ.get('SAM2_CKPT') or os.path.expanduser(
+        '~/.cache/huggingface/hub/models--facebook--sam2.1-hiera-small/snapshots/ee5bba1d82bb8749febdf90f45e84b687142ba03/sam2.1_hiera_small.pt')
+    if not os.path.exists(ckpt):
+        from huggingface_hub import hf_hub_download
+        ckpt = hf_hub_download(repo_id='facebook/sam2.1-hiera-small', filename='sam2.1_hiera_small.pt')
+    # the config ships INSIDE the sam2 package
+    cfg = 'configs/sam2.1/sam2.1_hiera_s.yaml'   # hydra resolves pkg://sam2
+    pred = build_sam2_video_predictor(cfg, ckpt, device=dev)
+    print(f'video engine: {dev}', flush=True)
+
+    # the loader parses file STEMS as ints — needs pure-number names
+    vin = out_path + '_vin'
+    os.makedirs(vin, exist_ok=True)
+    for k, fn in enumerate(sorted(f for f in os.listdir(work) if f.endswith('.jpg'))):
+        dst = f'{vin}/{k:05d}.jpg'
+        try: os.link(f'{work}/{fn}', dst)
+        except OSError: import shutil as _sh; _sh.copy(f'{work}/{fn}', dst)
+
+    with torch.inference_mode():
+        state = pred.init_state(video_path=vin, offload_video_to_cpu=True, offload_state_to_cpu=True)
+        # prompts on frame 0: manual boxes (obj per box) and/or YOLO persons
+        boxes = a.boxes
+        objs = 0
+        for chunk in boxes.split(';'):
+            chunk = chunk.strip()
+            if not chunk: continue
+            v = [float(x) for x in chunk.split(',')]
+            pred.add_new_points_or_box(state, frame_idx=0, obj_id=objs, box=np.array(v))
+            objs += 1
+        if a.auto_person:
+            from ultralytics import YOLO
+            yolo = YOLO('yolov8n.pt')
+            f0img = Image.open(f'{work}/' + sorted(os.listdir(work))[0]).convert('RGB')
+            det = yolo.predict(np.asarray(f0img), classes=[0], verbose=False, conf=a.conf)[0]
+            if det.boxes is not None:
+                for b in det.boxes.xyxy.cpu().numpy():
+                    pred.add_new_points_or_box(state, frame_idx=0, obj_id=objs, box=np.array(b.tolist()))
+                    objs += 1
+        if objs == 0:
+            print('no prompts — nothing to segment'); return False
+
+        masks_dir = out_path + '_masks'
+        os.makedirs(masks_dir, exist_ok=True)
+        count = 0
+        for frame_idx, obj_ids, masks in pred.propagate_in_video(state):
+            acc = None
+            for m in masks:
+                mm = (m > 0.0).squeeze().cpu().numpy()
+                acc = mm if acc is None else (acc | mm)
+            if acc is not None:
+                np.save(f'{masks_dir}/m{frame_idx:04d}.npy', acc)
+            count += 1
+            if count % 24 == 0: print('propagated', count, flush=True)
+    print(f'propagation done: {count} frames', flush=True)
+
+    # composite
+    files = sorted(f for f in os.listdir(work) if f.endswith('.jpg'))
+    idx = 0
+    for fn in files:
+        fi = f'{masks_dir}/m{idx:04d}.npy'
+        frame = Image.open(f'{work}/{fn}').convert('RGB')
+        if os.path.exists(fi):
+            mb = np.load(fi)
+            mimg = Image.fromarray((mb*255).astype('uint8')).resize((W,H), Image.BILINEAR)
+        else:
+            mimg = Image.new('L',(W,H),0)
+        comp = frame.convert('RGBA')
+        comp.alpha_composite(sh, (6,9)); comp.alpha_composite(txt)
+        comp.paste(frame,(0,0),mask=mimg)
+        comp.convert('RGB').save(f'{work}/c{idx:04d}.jpg', quality=90)
+        idx += 1
+        if idx % 24 == 0: print(f'comp {idx}', flush=True)
+    sp.run(['ffmpeg','-y','-loglevel','error','-framerate',str(fps_n),'-i',f'{work}/c%04d.jpg',
+            '-c:v','libx264','-pix_fmt','yuv420p','-crf','19','-movflags','+faststart', out_path], check=True)
+    if not a.keep_frames:
+        import shutil; shutil.rmtree(masks_dir, ignore_errors=True); shutil.rmtree(vin, ignore_errors=True)
+    print('done ->', out_path)
+    return True
+
 def main():
     ap = argparse.ArgumentParser(description='Text-behind-subject video effect (SAM2 + PIL + ffmpeg)')
     ap.add_argument('-i','--input', required=True)
@@ -178,6 +268,9 @@ def main():
                     help='text colour: auto = sample the background luminance (light bg -> black text). Default auto unless --amber given.')
     ap.add_argument('--report', action='store_true', help='print edge-hug score (mask boundary distance to real image edges, px — lower = tighter)')
     ap.add_argument('--conf', type=float, default=0.4, help='YOLO person confidence threshold')
+    ap.add_argument('--engine', default='video', choices=['video','flow'],
+                    help='video = official SAM2 video predictor (prompt once, model propagates every frame — stable on moving subjects, default); flow = legacy refresh+optical-flow hybrid')
+    ap.add_argument('--device', default='auto', help='torch device for the video engine: auto / mps / cuda / cpu')
     ap.add_argument('--keep-frames', action='store_true')
     a = ap.parse_args()
     find_ffmpeg()
@@ -246,6 +339,16 @@ def main():
         print(f'text zone luminance {lum:.0f} -> fill {fill}')
     sh, txt = build_text_layer(W, H, a.text, a.sub, main_x, main_y, sub_x, sub_y,
                                a.main_size, a.sub_size, fill, a.font)
+
+    if a.engine == 'video':
+        try:
+            ok = run_video_engine(a, W, H, fps_n, n, sh, txt, work, a.out)
+            if ok:
+                if not a.keep_frames:
+                    import shutil; shutil.rmtree(work, ignore_errors=True)
+                return
+        except Exception as e:
+            print(f'video engine failed ({e}) — falling back to flow engine', flush=True)
 
     prev_gray_u8 = None
     m_small = None

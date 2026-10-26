@@ -108,6 +108,24 @@ that's what sells the effect.
 - Moving performers (dancing lion, walking actor) drift out of fixed box
   prompts — use `--auto-person` for people, or re-prompt per refresh.
 
+## Engines (`--engine video|flow`)
+
+**`video` (default)** — the official [SAM2 video predictor](https://github.com/facebookresearch/sam2):
+prompt frame 0 ONCE (boxes and/or YOLO person boxes), and the model's memory
+module propagates the mask to **every frame with temporal consistency**. This
+is what finally fixed the jumping-text problem on moving subjects — the model
+tracks the subject itself, no per-frame re-prompting, no optical-flow guessing.
+Runs on Apple Metal (MPS ≈ 0.9 s/frame) or CUDA.
+
+Setup: `pip install sam2 decord` (decord = macOS/ARM: feed a frames dir — the
+tool extracts numbered frames itself and hard-links them).
+
+**`flow` (legacy)** — the refresh + optical-flow hybrid: SAM2 anchors every
+N frames, Farneback warps between. Fine for static cameras, weaker on motion.
+
+⚠ `cv2.calcOpticalFlowFarneback` on this machine returns an all-zero field
+for float32 input — the flow engine passes uint8 grays only.
+
 ## Edge-hug score (`--report`)
 
 `--report` prints an **edge-hug score**: the mean distance (px) from the mask
