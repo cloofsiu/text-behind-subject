@@ -38,15 +38,58 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 import cv2  # opencv-python-headless: mask cleanup + feathering
 
-def refine_mask(mask_bool_small, W, H, guide_gray=None):
-    """upscale -> guided-filter edge snap -> morphology -> per-column TOP-EDGE
-    SNAP -> 1D median boundary smoothing -> drop specks -> tight 1px feather.
+def hug_of(mask_bool_small, W, H, g_full):
+    """edge-hug score: mean distance from the mask boundary to the nearest real
+    image edge (px, lower = tighter). Used to reject garbage masks."""
+    _, m8 = refine_mask(mask_bool_small, W, H, g_full)
+    img_edges = cv2.Canny((g_full * 255).astype(np.uint8), 60, 160)
+    dtm = cv2.distanceTransform((img_edges == 0).astype(np.uint8), cv2.DIST_L2, 3)
+    me = cv2.Canny(m8, 50, 150)
+    return float(dtm[me > 0].mean()) if me.any() else 999.0
 
-    guide_gray: float32 grayscale (H,W), 0..1 — snaps the mask boundary to the
-    frame's real image edges. The top-edge snap additionally pulls the mask's
-    top boundary down onto the strongest horizontal image edge within a small
-    band, which removes the systematic "fabric strip" bias that generous SAM2
-    box prompts leave above the true silhouette top."""
+def _propagate_guarded(mask_small, prev_gray_u8, cur_gray_u8, frame, W, H, hug_scores, report, i, last_good):
+    """flow-warp the mask, then ALWAYS verify the warped mask with the hug
+    score — flow polluted by baked motion graphics (sweeping cartoons, whip
+    pans) smears the mask even when the *mean* flow looks small (localized
+    big motion diluted by a static background). On failure: RESTORE the last
+    accepted fresh SAM2 anchor — the current mask may already carry
+    incremental pollution (the ratchet effect), so freezing it is not enough.
+    Returns (mask, flow_mag)."""
+    m_new, mag = _propagate(mask_small, prev_gray_u8, cur_gray_u8)
+    g_full = cv2.cvtColor(np.asarray(frame), cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    hug = hug_of(m_new, W, H, g_full)
+    med = float(np.median(hug_scores)) if hug_scores else 20.0
+    guard = max(40.0, 3.0 * med)
+    if hug > guard:
+        if report:
+            print(f'  freeze mask at frame #{i} (flow {mag:.2f}px, warped hug {hug:.0f}px > guard {guard:.0f}px) -> restore last good anchor', flush=True)
+        return (last_good if last_good is not None else mask_small), mag
+    return m_new, mag
+
+def _propagate(mask_small, prev_gray_u8, cur_gray_u8):
+    """optical-flow warp: move the mask WITH the subject between SAM2 refreshes.
+    ⚠ Farneback on this machine returns an all-zero field for float32 input —
+    it only works with UINT8 grays. Returns (new_mask, mean flow magnitude)."""
+    flow = cv2.calcOpticalFlowFarneback(prev_gray_u8, cur_gray_u8, None,
+                                        0.5, 3, 15, 3, 5, 1.2, 0)
+    h_, w_ = mask_small.shape
+    gx, gy = np.meshgrid(np.arange(w_, dtype=np.float32),
+                         np.arange(h_, dtype=np.float32))
+    mx = gx + flow[..., 0]; my = gy + flow[..., 1]
+    m_new = cv2.remap(mask_small.astype(np.float32), mx, my, cv2.INTER_LINEAR,
+                      borderMode=cv2.BORDER_REPLICATE) > 0.5
+    mag = float(np.sqrt(flow[..., 0]**2 + flow[..., 1]**2).mean())
+    return m_new, mag
+
+def refine_mask(mask_bool_small, W, H, guide_gray=None):
+    """upscale -> guided-filter edge snap -> per-column top-edge snap ->
+    1D median smoothing -> morphology -> drop specks -> tight 1px feather.
+
+    guide_gray: float32 grayscale (H,W), 0..1 — snaps the boundary to the
+    frame's real image edges; the top-edge snap pulls the mask's top boundary
+    down onto the strongest horizontal image edge in a small band, removing
+    the "fabric strip" bias that generous SAM2 box prompts leave above the
+    true silhouette top. Returns (feathered alpha image, raw uint8 mask)."""
     mfull = cv2.resize(mask_bool_small.astype(np.float32), (W, H),
                        interpolation=cv2.INTER_LINEAR)
     if guide_gray is not None:
@@ -86,7 +129,8 @@ def refine_mask(mask_bool_small, W, H, guide_gray=None):
     for i in range(1, num):
         if stats[i, cv2.CC_STAT_AREA] < 3000:
             m8[lab == i] = 0
-    return Image.fromarray(cv2.GaussianBlur(m8, (0, 0), 1.0))
+    alpha = Image.fromarray(cv2.GaussianBlur(m8, (0, 0), 1.0))
+    return alpha, m8
 
 def find_ffmpeg():
     try:
@@ -129,10 +173,25 @@ def main():
     ap.add_argument('--sub-size', type=int, default=44)
     ap.add_argument('--font', default='/System/Library/AssetsV2/com_apple_MobileAsset_Font8/86ba2c91f017a3749571a82f2c6d890ac7ffb2fb.asset/AssetData/PingFang.ttc',
                     help='TTC/TTF font (default: macOS PingFang HK)')
-    ap.add_argument('--amber', action='store_true', help='amber text instead of white')
+    ap.add_argument('--amber', action='store_true', help='amber text instead of white (legacy alias of --color amber)')
+    ap.add_argument('--color', default=None, choices=['auto','white','black','amber'],
+                    help='text colour: auto = sample the background luminance (light bg -> black text). Default auto unless --amber given.')
+    ap.add_argument('--report', action='store_true', help='print edge-hug score (mask boundary distance to real image edges, px — lower = tighter)')
+    ap.add_argument('--conf', type=float, default=0.4, help='YOLO person confidence threshold')
     ap.add_argument('--keep-frames', action='store_true')
     a = ap.parse_args()
     find_ffmpeg()
+
+    if a.amber and a.color is None:
+        a.color = 'amber'
+    if a.color is None:
+        a.color = 'auto'
+
+    boxes = []
+    for chunk in a.boxes.split(';'):
+        chunk = chunk.strip()
+        if chunk:
+            boxes.append(tuple(float(v) for v in chunk.split(',')))
 
     # probe source size via 1-frame extract (stream metadata can lie about rotation)
     os.makedirs('.tbs_probe', exist_ok=True)
@@ -148,18 +207,15 @@ def main():
     sam = SAM('sam2.1_b.pt')
     yolo = YOLO('yolov8n.pt') if a.auto_person else None
 
-    boxes = []
-    for chunk in a.boxes.split(';'):
-        chunk = chunk.strip()
-        if chunk:
-            boxes.append(tuple(float(v) for v in chunk.split(',')))
-    fill = (245, 158, 11) if a.amber else (255, 255, 255)
+    fill = None
+    if a.amber and a.color is None:
+        a.color = 'amber'
+    if a.color is None:
+        a.color = 'auto'
     main_x = a.text_x if a.text_x is not None else W // 2
     main_y = a.text_y if a.text_y is not None else H // 2
     sub_x  = a.text_x if a.text_x is not None else W // 2
     sub_y  = a.sub_y  if a.sub_y  is not None else main_y + 130
-    sh, txt = build_text_layer(W, H, a.text, a.sub, main_x, main_y, sub_x, sub_y,
-                               a.main_size, a.sub_size, fill, a.font)
 
     work = a.out + '_work'
     os.makedirs(work, exist_ok=True)
@@ -167,8 +223,35 @@ def main():
                     '-i',a.input,'-vf',f'fps={fps_n}','-pix_fmt','yuvj420p','-start_number','0','-q:v','2',
                     f'{work}/s%04d.jpg'], check=True)
 
-    prev_gray = None
+    # ADAPTIVE TEXT COLOUR: sample the luminance under the visible (upper) half
+    # of the text bbox on the first frame — light background -> dark text.
+    # White text on a white studio wall is the #1 way this effect fails.
+    tmp = Image.new('L', (W, H), 0)
+    dt_ = ImageDraw.Draw(tmp)
+    f_main = ImageFont.truetype(a.font, a.main_size, index=8)
+    dt_.text((main_x, main_y), a.text, font=f_main, fill=255, anchor='mm')
+    bb = tmp.getbbox()
+    fill = (255, 255, 255)
+    if bb:
+        zone = Image.open(f'{work}/s0000.jpg').convert('L').crop((bb[0], bb[1], bb[2], (bb[1]+bb[3])//2))
+        lum = float(np.asarray(zone).mean())
+        if a.color == 'auto':
+            fill = (18, 18, 18) if lum > 130 else (255, 255, 255)
+        elif a.color == 'black':
+            fill = (18, 18, 18)
+        elif a.color == 'white':
+            fill = (255, 255, 255)
+        elif a.color == 'amber':
+            fill = (245, 158, 11)
+        print(f'text zone luminance {lum:.0f} -> fill {fill}')
+    sh, txt = build_text_layer(W, H, a.text, a.sub, main_x, main_y, sub_x, sub_y,
+                               a.main_size, a.sub_size, fill, a.font)
+
+    prev_gray_u8 = None
     m_small = None
+    hug_scores = []
+    fresh = False
+    last_good = None
     sw, shh = W // 2, H // 2
     for i in range(n):
         fi = f'{work}/s{i:04d}.jpg'
@@ -176,13 +259,15 @@ def main():
         frame = Image.open(fi).convert('RGB')
         small = frame.resize((sw, shh), Image.BILINEAR)
         arr = np.asarray(small)
-        cur_gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+        cur_gray_u8 = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)   # uint8 — Farneback needs it
+        fresh = False
 
         if i % a.every == 0 or m_small is None:
             # --- refresh: SAM2 anchor (persons and/or boxes, UNIONED) ---
+            fresh = True
             M_p = M_b = None
             if yolo is not None:
-                det = yolo.predict(arr, classes=[0], verbose=False, conf=0.4)[0]
+                det = yolo.predict(arr, classes=[0], verbose=False, conf=a.conf)[0]
                 if det.boxes is not None and len(det.boxes):
                     all_boxes = [b.tolist() for b in det.boxes.xyxy.cpu().numpy()]
                     r = sam.predict(arr, bboxes=all_boxes, verbose=False)[0]
@@ -197,26 +282,51 @@ def main():
             M = M_p if M_p is not None else M_b
             if M_p is not None and M_b is not None:
                 M = M_p | M_b   # combined mode: person AND boxes occlude
-            if M is None:
-                M = m_small if m_small is not None else np.zeros((shh, sw), bool)
+            if M is not None:
+                # HUG-GUARD: score the fresh mask; reject garbage (e.g. baked
+                # graphics + subject fused into one blob) and keep propagating.
+                g_full = cv2.cvtColor(np.asarray(frame), cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+                hug = hug_of(M, W, H, g_full)
+                med = float(np.median(hug_scores)) if hug_scores else hug
+                guard = max(40.0, 3.0 * med)
+                if hug > guard:
+                    print(f'  reject bad mask at frame #{i} (hug {hug:.0f}px > guard {guard:.0f}px), keeping propagated mask', flush=True)
+                    M = None   # fall through to propagation below
+                elif a.report:
+                    print(f'  refresh #{i}: hug {hug:.1f}px <= guard {guard:.1f}px accepted', flush=True)
+            if M is not None:
+                m_small = (0.65 * M + 0.35 * m_small) > 0.4 if m_small is not None else M
+                last_good = m_small.copy()
             elif m_small is not None:
-                M = (0.65 * M + 0.35 * m_small) > 0.4   # EMA vs flicker
-            m_small = M
-        else:
+                m_small, fresh_ok = _propagate_guarded(
+                    m_small, prev_gray_u8, cur_gray_u8, frame, W, H, hug_scores, a.report, i, last_good)
+        elif m_small is not None:
             # --- propagate: optical flow moves the mask WITH the subject so
             #     the cut edge stays continuous between SAM2 refreshes ---
-            flow = cv2.calcOpticalFlowFarneback(prev_gray, cur_gray, None,
-                                                0.5, 3, 15, 3, 5, 1.2, 0)
-            h_, w_ = m_small.shape
-            gx, gy = np.meshgrid(np.arange(w_, dtype=np.float32),
-                                 np.arange(h_, dtype=np.float32))
-            mx = gx + flow[..., 0]; my = gy + flow[..., 1]
-            m_small = cv2.remap(m_small.astype(np.float32), mx, my,
-                                cv2.INTER_LINEAR,
-                                borderMode=cv2.BORDER_REPLICATE) > 0.5
-        prev_gray = cur_gray
+            m_small, fresh_ok = _propagate_guarded(
+                m_small, prev_gray_u8, cur_gray_u8, frame, W, H, hug_scores, a.report, i, last_good)
+        prev_gray_u8 = cur_gray_u8
         guide = cv2.cvtColor(np.asarray(frame), cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
-        mimg = refine_mask(m_small, W, H, guide)
+        mimg, m8 = refine_mask(m_small, W, H, guide)
+        # FINAL PASTE GUARD: if the refined mask is wildly misaligned with the
+        # current frame (subject covered by a baked title card / wrong blob),
+        # the paste would repaint garbage over the text — skip it instead.
+        # Threshold well above the freeze guard: legitimately soft-edge scenes
+        # (dark subject on white, hug ~70px) must NOT trigger this.
+        med_h = float(np.median(hug_scores)) if hug_scores else 20.0
+        img_edges = cv2.Canny((guide * 255).astype(np.uint8), 60, 160)
+        dtm = cv2.distanceTransform((img_edges == 0).astype(np.uint8), cv2.DIST_L2, 3)
+        me = cv2.Canny(m8, 50, 150)
+        if me.any():
+            hug_final = float(dtm[me > 0].mean())
+            if hug_final > max(120.0, 4.0 * med_h):
+                mimg = Image.new('L', (W, H), 0)   # no paste: text stays fully visible
+        if a.report and fresh:
+            img_edges = cv2.Canny((guide * 255).astype(np.uint8), 60, 160)
+            dt = cv2.distanceTransform((img_edges == 0).astype(np.uint8), cv2.DIST_L2, 3)
+            me = cv2.Canny(m8, 50, 150)
+            if me.any():
+                hug_scores.append(float(dt[me > 0].mean()))
 
         comp = frame.convert('RGBA')
         comp.alpha_composite(sh, (6, 9))
@@ -231,6 +341,12 @@ def main():
     subprocess.run(cmd, check=True)
     if not a.keep_frames:
         import shutil; shutil.rmtree(work, ignore_errors=True)
+    if a.report and hug_scores:
+        import statistics as st
+        mean_h = st.mean(hug_scores); worst_h = max(hug_scores)
+        flags = [f'#{k*a.every}' for k,s in enumerate(hug_scores) if s > 100]
+        warn = f'  ⚠ anomalous masks at frames {flags} — spot-check' if flags else ''
+        print(f'edge-hug: mean {mean_h:.2f}px  worst {worst_h:.2f}px  over {len(hug_scores)} refreshes (lower = tighter){warn}')
     print('done ->', a.out)
 
 if __name__ == '__main__':

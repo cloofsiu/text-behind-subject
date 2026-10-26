@@ -108,6 +108,37 @@ that's what sells the effect.
 - Moving performers (dancing lion, walking actor) drift out of fixed box
   prompts — use `--auto-person` for people, or re-prompt per refresh.
 
+## Edge-hug score (`--report`)
+
+`--report` prints an **edge-hug score**: the mean distance (px) from the mask
+boundary to the nearest *real image edge* of the frame — how far the cut line
+is from the actual subject. Rough guide: 2-3px = tight; ~100px = soft-edge
+sources (dark subject on a white background — usually still looks fine).
+Refreshes outside sane bounds get flagged so you know where to look.
+
+Three guards make the pipeline self-healing:
+
+1. **hug-guard on refresh** — a garbage SAM2 anchor (subject fused with a
+   foreground graphic) is rejected; the flow-anchored mask carries on.
+2. **flow re-verification every frame** — if the flow is hijacked by the
+   video's own overlay graphics or a whip pan, the mask re-anchors to the
+   last good SAM2 mask instead of smearing.
+3. **refined-mask check before compositing** — if the mask still isn't on
+   real edges, the subject-over-text paste is skipped so the text stays
+   readable.
+
+Hard-won detail: `cv2.calcOpticalFlowFarneback` silently returns an
+**all-zero flow for float32 input** on this setup — pass uint8 grays.
+
+## New in this version
+
+- `--color auto` (default): samples the luminance under the text and picks
+  white (dark frame) or near-black (light frame) — no more invisible text on
+  bright backdrops.
+- `--conf`: YOLO confidence. Lower it when the subject is clipped (head out
+  of frame) — YOLO often drops body-only detections entirely.
+- `--report` + the three guards above.
+
 ## Real-world result
 
 Rendered on an M1 MacBook Pro (CPU only, SAM2 base): ~50 SAM2 refreshes for a
