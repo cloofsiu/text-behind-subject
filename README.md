@@ -119,6 +119,11 @@ A person, a robot, a device held in frame — one thing the viewer can name.
   and full-frame close-ups (nothing left for the text to sit behind)
 - rotating/moving subjects: use the video engine (default) — it tracks rotation
   with temporal consistency; the legacy flow engine snaps on fast motion
+- ❌ also unstable: footage with **baked animated overlays** (source videos that
+  already carry title cards, flame FX, sticker animations on top of the picture).
+  The overlays move every frame, so the mask hugs them and the text jitters —
+  even when the real occluder is clean. Static baked elements (subs, logos) are
+  fine; it is the *animated* ones that poison tracking.
 
 ## Engines (`--engine video|flow`)
 
