@@ -108,6 +108,18 @@ that's what sells the effect.
 - Moving performers (dancing lion, walking actor) drift out of fixed box
   prompts — use `--auto-person` for people, or re-prompt per refresh.
 
+## Choosing footage (hard rule)
+
+The effect needs **ONE clear main subject** that crosses the text line.
+A person, a robot, a device held in frame — one thing the viewer can name.
+
+- ✅ good: single person, single robot, a device/glove close-up, person+robot pair
+- ❌ bad: wide crowd shots (a dozen people = a dozen masks chopping the text into
+  confetti — the "robocon arena" failure), empty scenes with no occluder at all,
+  and full-frame close-ups (nothing left for the text to sit behind)
+- rotating/moving subjects: use the video engine (default) — it tracks rotation
+  with temporal consistency; the legacy flow engine snaps on fast motion
+
 ## Engines (`--engine video|flow`)
 
 **`video` (default)** — the official [SAM2 video predictor](https://github.com/facebookresearch/sam2):
