@@ -1,0 +1,6 @@
+Your AI agents can edit video now. Watch this.
+This is the text-behind-subject effect.
+Big text, sandwiched between the background and your subject.
+An agent tracks every frame, and renders behind it.
+I packed it into one skill file. Hand it to any agent: Claude, Codex, your own.
+Comment SKILL, and I will send it to you.

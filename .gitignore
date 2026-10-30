@@ -1,5 +1,8 @@
-__pycache__/
-*.pt
 *.mp4
-.tbs_probe/
+*.npz
+*.pt
 tests_local/
+__pycache__/
+cmp_*.png
+v1f_*.png
+.DS_Store
